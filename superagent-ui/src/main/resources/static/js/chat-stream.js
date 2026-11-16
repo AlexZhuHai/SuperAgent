@@ -3,16 +3,32 @@
 "use strict";
 
 // ---------- send / stream / stop ----------
+// The reply being streamed to this page. Switching to another agent only stops listening: the server keeps working on
+// the reply and stores it, and coming back reattaches to it (pollLive) or shows it finished.
+let sending = null; // { abort, detached }
+
+/** Stop listening to the reply in progress (it carries on on the server) so another agent can be opened. */
+function detachStream() {
+  if (!sending) return;
+  sending.detached = true;
+  sending.abort.abort();
+  sending = null;
+  setStreaming(false);
+}
+
 async function sendMessage(text, images, imageUrls, fileIds, fileNames) {
   if (!activeSessionId) { openAgentModal(); return; }
   const userMsg = addUserBubble(text, imageUrls, fileNames);
   const handles = addAssistantBubble();
+  const me = { abort: new AbortController(), detached: false };
+  sending = me;
   setStreaming(true);
   try {
     const resp = await fetch("/api/v1/sessions/" + activeSessionId + "/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: text, images: images || [], fileIds: fileIds || [] }),
+      signal: me.abort.signal,
     });
     if (resp.status === 409) {
       // Another member's turn is running: nothing was sent, so give the text back.
@@ -29,9 +45,12 @@ async function sendMessage(text, images, imageUrls, fileIds, fileNames) {
     }
     await consumeSse(resp, handles);
   } catch (e) {
+    if (me.detached) return; // the user opened another agent: the reply carries on without this page
     handles.text.classList.remove("is-streaming");
     handles.text.textContent = L("chat.connFailed", { msg: e.message });
   } finally {
+    if (me.detached) { loadAgents(); return; } // the sidebar shows it's still at work
+    if (sending === me) sending = null;
     handles.text.classList.remove("is-streaming");
     setStreaming(false);
     await selectSession(activeSessionId); // refresh with ids so messages become editable
@@ -102,10 +121,8 @@ function handleFrame(frame, handles) {
       if (ev.payload) renderStreamText(handles.text, ev.payload);
       break;
     case "stopped": {
-      const chip = document.createElement("span");
-      chip.className = "stopped-chip";
-      chip.textContent = L("chat.stopped");
-      handles.text.after(chip);
+      handles.text.classList.remove("is-streaming");
+      handles.text.after(stoppedNote(!handles.text.textContent.trim()));
       break;
     }
     case "error":

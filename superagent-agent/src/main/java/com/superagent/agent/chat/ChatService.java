@@ -186,6 +186,8 @@ public class ChatService {
             tools.addAll(SUPERAGENT_MCP_TOOLS);
             tools.addAll(McpGrants.WORK_TOOLS);
             tools.addAll(AgentCollabMcpTools.TOOLS);
+            tools.addAll(com.superagent.agent.AgentCreateMcpTools.TOOLS);
+            tools.addAll(com.superagent.agent.AgentUpdateMcpTools.TOOLS);
             tools.addAll(McpGrants.SKILL_CHAT_TOOLS);
             tools.addAll(com.superagent.agent.AgentSkillMcpTools.TOOLS);
         } else {
@@ -652,9 +654,17 @@ public class ChatService {
                 .map(this::currentSessionId).map(activeRuns::get).ifPresent(Cancellation::cancel);
     }
 
-    /** Edits a stored message's content in place (record only; does not re-run the agent). */
+    /**
+     * Edits one of the user's own messages in place (record only; does not re-run the agent). What the model wrote is
+     * the record of what it said, and isn't edited by anyone.
+     */
     public void editMessage(String sessionId, String messageId, String content) {
         store.findSession(sessionId).orElseThrow(() -> new SessionNotFoundException(sessionId));
+        ChatMessage m = store.listMessages(sessionId).stream().filter(x -> x.id().equals(messageId)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("No such message: " + messageId));
+        if (m.role() != MessageRole.USER) {
+            throw new IllegalArgumentException("模型输出的内容不能编辑");
+        }
         store.updateMessage(sessionId, messageId, content);
     }
 
@@ -664,10 +674,19 @@ public class ChatService {
      */
     public static final String ERROR_MARK = "⚠️ 出错了：";
 
-    /** The reply as stored: what was said, then the error if the turn failed (a stopped turn isn't an error). */
+    /**
+     * Ends a reply that stopped before it finished: the user stopped it, or the server went down mid-turn. The page
+     * shows it as a note under the reply; it reads as plain words where the history is carried into a new session.
+     */
+    public static final String STOPPED_MARK = "⏸ 回复被中断";
+
+    /** The reply as stored: what was said, then the error if the turn failed, or that it was stopped. */
     static String storedReply(String text, String error, boolean cancelled) {
         String said = text == null ? "" : text;
-        if (error == null || error.isBlank() || cancelled) {
+        if (cancelled) {
+            return (said.isBlank() ? "" : said.stripTrailing() + "\n\n") + STOPPED_MARK;
+        }
+        if (error == null || error.isBlank()) {
             return said;
         }
         return (said.isBlank() ? "" : said.stripTrailing() + "\n\n") + ERROR_MARK + error.strip();

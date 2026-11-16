@@ -289,18 +289,23 @@ public class TaskService implements TaskRecovery {
     }
 
     /**
-     * The pool lives in memory, so without this every restart would start empty and the
-     * next task would mint a new session even though finished tasks left reusable ones on
-     * disk. Sessions of tasks waiting on a confirmation stay reserved for them; sessions of
-     * RUNNING tasks are left to the watchdog, which resumes those tasks on them.
+     * The pool lives in memory, so without this every restart would start empty and the next task would mint a new
+     * session even though finished tasks left reusable ones on disk. Per workspace only the conversation its latest
+     * task ran in comes back (older ones were left behind on purpose). Sessions of tasks waiting on a confirmation stay
+     * reserved for them; sessions of RUNNING tasks are left to the watchdog, which resumes those tasks on them.
      */
     @EventListener(CompanyStarted.class)
     void restoreSessions() {
         List<Task> all = tasks.listTasks().stream().filter(t -> t.workspaceDir() != null).toList();
-        Set<String> running = new java.util.HashSet<>();
-        all.stream().filter(t -> t.status() == TaskStatus.RUNNING).forEach(t -> running.add(boundSessionId(t)));
-        int restored = 0;
+        Set<String> busyWorkspaces = new java.util.HashSet<>();
+        all.stream().filter(t -> t.status() == TaskStatus.RUNNING || holdsSession(t.status()))
+                .forEach(t -> busyWorkspaces.add(t.workspaceDir()));
+        Map<String, Task> latest = new HashMap<>();
+        all.stream().filter(t -> !busyWorkspaces.contains(t.workspaceDir()))
+                .forEach(t -> latest.merge(t.workspaceDir(), t, (a, b) -> a.updatedAt().isAfter(b.updatedAt()) ? a : b));
         synchronized (schedulerLock) {
+            latest.values().forEach(t -> pool.restore(t.createdBy(), t.agentType(), boundSessionId(t), t.workspaceDir(),
+                    t.model(), null));
             for (Task t : all) {
                 String sessionId = boundSessionId(t);
                 if (t.status() != TaskStatus.RUNNING && !holdsSession(t.status())
@@ -315,8 +320,8 @@ public class TaskService implements TaskRecovery {
                 }
             }
         }
-        if (restored > 0) {
-            log.info("restored idle task sessions from {} finished task(s)", restored);
+        if (!latest.isEmpty()) {
+            log.info("restored {} idle task session(s)", latest.size());
         }
         requeueWaitingSteering(all);
     }
@@ -1046,6 +1051,18 @@ public class TaskService implements TaskRecovery {
         if (choice == null) {
             return; // nothing can run: the stand-in stays, and fails at the runner with a clear error
         }
+        if (!choice.refused() && com.superagent.core.task.TaskModelChoice.BY_FIXED.equals(choice.by())
+                && !runners.containsKey(AgentType.fromString(choice.cli()))) {
+            choice = new com.superagent.core.task.TaskModelChoice(task.id(), 0, choice.by(), null, null, null, null, null,
+                    choice.candidates(), choice.reasoning() + "（但 " + choice.model() + " 要用 " + choice.cli()
+                    + "，这里还不能用它执行任务；开启了固定模型，不改用其他模型。）", choice.createdAt());
+        }
+        if (choice.refused()) {
+            recordChoice(choice);
+            runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.ERROR, choice.reasoning()));
+            settle(task, TaskStatus.ERROR, 0, choice.reasoning(), BigDecimal.ZERO);
+            return;
+        }
         AgentType type = AgentType.fromString(choice.cli());
         if (!runners.containsKey(type)) {
             choice = new com.superagent.core.task.TaskModelChoice(task.id(), 0, com.superagent.core.task.TaskModelChoice.BY_FALLBACK,
@@ -1128,7 +1145,21 @@ public class TaskService implements TaskRecovery {
         if (made.isEmpty() || made.stream().anyMatch(c -> com.superagent.core.task.TaskModelChoice.BY_USER.equals(c.by()))) {
             return false;
         }
+        if (made.get(made.size() - 1).refused()) {
+            return false; // already told why it can't run
+        }
         var up = selector.escalate(task, error == null ? "执行失败" : error).orElse(null);
+        if (up != null && !up.refused() && com.superagent.core.task.TaskModelChoice.BY_FIXED.equals(up.by())
+                && !runners.containsKey(AgentType.fromString(up.cli()))) {
+            up = new com.superagent.core.task.TaskModelChoice(task.id(), 0, up.by(), null, null, null, null, null,
+                    up.candidates(), up.reasoning() + "（但 " + up.model() + " 要用 " + up.cli()
+                    + "，这里还不能用它执行任务；开启了固定模型，不改用其他模型，任务失败。）", up.createdAt());
+        }
+        if (up != null && up.refused()) {
+            recordChoice(up);
+            runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.SYSTEM, up.reasoning()));
+            return false;
+        }
         if (up == null || !runners.containsKey(AgentType.fromString(up.cli()))) {
             return false;
         }
@@ -1166,7 +1197,7 @@ public class TaskService implements TaskRecovery {
      */
     private void schedule(Task task) {
         synchronized (schedulerLock) {
-            TaskSessionPool.Lease lease = pool.acquire(task.createdBy(), task.agentType(), task.id());
+            TaskSessionPool.Lease lease = pool.acquire(task.createdBy(), task.agentType(), task.id(), task.model());
             if (lease != null) {
                 assignAndRun(task, lease, task.brief(), true);
             } else {
@@ -1209,7 +1240,7 @@ public class TaskService implements TaskRecovery {
                         resumeRun(task, lease, run.prompt());
                     }
                 } else {
-                    TaskSessionPool.Lease lease = pool.acquire(owner, task.agentType(), run.taskId());
+                    TaskSessionPool.Lease lease = pool.acquire(owner, task.agentType(), run.taskId(), task.model());
                     if (lease == null) {
                         continue; // no idle session of this CLI and at the cap; another CLI's run may still fit
                     }
@@ -1285,6 +1316,7 @@ public class TaskService implements TaskRecovery {
 
     /** Continues a task in the leased session, keeping its workspace and start time. Call under schedulerLock. */
     private void resumeRun(Task task, TaskSessionPool.Lease lease, String prompt) {
+        lease.session().model = task.model();
         Task running = task.withStatus(TaskStatus.RUNNING);
         tasks.save(running);
         publish(running, null);
@@ -1376,8 +1408,11 @@ public class TaskService implements TaskRecovery {
 
     // --- resilience (TaskRecovery, driven by the watchdog) ---
 
-    /** Rotate to a fresh session after this many consecutive failures on one session. */
-    private static final int ROTATE_AFTER = 3;
+    /**
+     * A failed run goes on in a fresh session (same workspace): a broken conversation (e.g. thinking blocks the API
+     * no longer accepts) fails the same way every time it is resumed.
+     */
+    private static final int ROTATE_AFTER = 1;
     /** Overall retry budget before a task is given up for good. */
     private static final int MAX_ATTEMPTS = 10;
 
@@ -1422,11 +1457,11 @@ public class TaskService implements TaskRecovery {
             } else if (rotate) {
                 sessionId = UUID.randomUUID().toString();   // fresh conversation, same workspace (keep prior work)
                 firstTurn = true;
-                pool.adopt(task.createdBy(), task.agentType(), id, sessionId, task.workspaceDir(), false);
+                pool.adopt(task.createdBy(), task.agentType(), id, sessionId, task.workspaceDir(), false).model = task.model();
             } else {
-                sessionId = deriveSessionId(task);  // restart: pool is empty, resume the persisted agent session
+                sessionId = boundSessionId(task);   // restart: pool is empty, resume the task's own agent session
                 firstTurn = false;
-                pool.adopt(task.createdBy(), task.agentType(), id, sessionId, task.workspaceDir(), true);
+                pool.adopt(task.createdBy(), task.agentType(), id, sessionId, task.workspaceDir(), true).model = task.model();
             }
         }
 
@@ -1437,7 +1472,6 @@ public class TaskService implements TaskRecovery {
         Task running = task.withStatus(TaskStatus.RUNNING);
         tasks.save(running);
         publish(running, null);
-        String prompt = recoverPrompt(rotate);
         String sid = sessionId;
         boolean ft = firstTurn;
         log.info("recovering task {} (attempt {}, failures {}, rotate={}, session {})",
@@ -1453,11 +1487,33 @@ public class TaskService implements TaskRecovery {
         return Path.of(task.workspaceDir()).getFileName().toString();
     }
 
-    private static String recoverPrompt(boolean rotate) {
-        return rotate
-                ? "上一个会话连续失败。工作区里可能已有部分成果，请基于现有文件重新评估并完成本任务，然后给出交付总结。"
-                : "服务刚恢复，或上一次执行被中断。请检查工作区已有成果，从中断处继续完成本任务；若其实已完成，请做收尾并给出交付总结。";
+    /**
+     * Picks up an interrupted run where it stopped. A fresh session sees none of the earlier conversation, so it is
+     * given the task again (and a coding task its PRD and the step it is on), never just "carry on".
+     */
+    private void recoverRun(Task task, String sessionId, boolean freshSession) {
+        if (TaskKind.fromStorage(task.flow()) == TaskKind.CODING) {
+            String prompt = codingFlow.resumePrompt(codingFlow.load(task.id()), task.brief(), freshSession);
+            if (prompt != null) {
+                run(task, prompt, sessionId, freshSession, false);
+                return;
+            }
+        }
+        if (!freshSession) {
+            run(task, RESUME_NOTE, sessionId, false, false);
+        } else if (isComplex(task)) {
+            run(task, FRESH_NOTE + "\n\n任务说明：\n" + task.brief(), sessionId, true, false); // don't plan the subtasks again
+        } else {
+            run(task, FRESH_NOTE + "\n\n" + task.brief(), sessionId, true, true);
+        }
     }
+
+    static final String NEW_TASK_NOTE = "（以下是一个新任务，和这个会话里之前的任务无关。之前的对话只作背景参考，"
+            + "以下面的任务说明为准，不要去完成或验收之前的任务。）";
+    private static final String RESUME_NOTE =
+            "服务刚恢复，或上一次执行被中断。请检查工作区已有成果，从中断处继续完成本任务；若其实已完成，请做收尾并给出交付总结。";
+    static final String FRESH_NOTE =
+            "（上一次执行中断了，这是一个新会话，看不到之前的对话。工作区里可能已有这个任务的部分成果：先检查，已完成的不要重做，接着把任务做完。）";
 
     /** Dispatches a scheduled turn: coding tasks run the fixed PRD→develop→verify flow, others run single-pass. */
     private void run(Task task, String prompt, String agentSessionId, boolean sessionFirstTurn, boolean wrapBriefPrompt) {
@@ -1713,7 +1769,7 @@ public class TaskService implements TaskRecovery {
                 }
 
                 if (CodingFlow.PRD.equals(phase.key())) {
-                    String prd = firstNonBlank(turn.finalText());
+                    String prd = CodingFlow.isPrd(turn.finalText()) ? turn.finalText() : null;
                     if (prd == null) {
                         TurnResult retry = executeTurn(task, CodingFlow.PRD_RETRY_PROMPT, agentSessionId, false, false, null, cancellation, phase.key());
                         addSpend(task.id(), retry.cost());
@@ -1721,7 +1777,7 @@ public class TaskService implements TaskRecovery {
                             settle(task, TaskStatus.STOPPED, CodingFlow.runningProgress(i), null, BigDecimal.ZERO);
                             return;
                         }
-                        prd = firstNonBlank(retry.finalText());
+                        prd = CodingFlow.isPrd(retry.finalText()) ? retry.finalText() : null;
                         if (prd == null) {
                             pauseForGate(task, phases, i, "第1步未产出 PRD");
                             return;

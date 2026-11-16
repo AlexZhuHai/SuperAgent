@@ -30,6 +30,10 @@ import java.util.Optional;
  *
  * <p>When a task fails it moves to the next dearer model and starts over, step by step up to the default model: the
  * outcome stays in hand, and the cost only rises as far as it must.
+ *
+ * <p>When the admin holds tasks to fixed models, every task (plain, complex, subtask, automation) skips judging: it
+ * starts on the cheapest of them and moves up through them on failure. When none is left, the choice says the task
+ * fails, and why; it never falls back to a model outside the set.
  */
 @Service
 public class TaskModelRouter implements TaskModelSelector {
@@ -59,6 +63,10 @@ public class TaskModelRouter implements TaskModelSelector {
 
     @Override
     public Optional<TaskModelChoice> choose(Task task) {
+        List<String> fixed = settings.taskFixedModels();
+        if (!fixed.isEmpty()) {
+            return Optional.of(fixedStart(task, fixed, "不判断难度，"));
+        }
         List<Candidate> all = prices.candidates();
         List<Candidate> forTasks = all.stream().filter(Candidate::forTasks).toList();
         if (forTasks.isEmpty()) {
@@ -85,6 +93,10 @@ public class TaskModelRouter implements TaskModelSelector {
 
     @Override
     public Optional<TaskModelChoice> escalate(Task task, String failure) {
+        List<String> fixed = settings.taskFixedModels();
+        if (!fixed.isEmpty()) {
+            return Optional.of(fixedNext(task, fixed, failure));
+        }
         List<Candidate> forTasks = prices.candidates().stream().filter(Candidate::forTasks).toList();
         Candidate top = defaultFor(forTasks);
         if (top == null || top.id().equals(task.model())) {

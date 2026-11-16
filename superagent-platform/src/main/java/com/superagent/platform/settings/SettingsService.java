@@ -63,6 +63,14 @@ public class SettingsService {
         if (model != null && !model.equals(agentDefaultModel()) && providerService.cliFor(model).isEmpty()) {
             throw new IllegalArgumentException("Model " + model + " has not passed the inference check");
         }
+        // Checked before anything is written, so a refused save changes nothing.
+        java.util.List<String> fixed = request.taskFixedModels() == null ? savedTaskFixedModels()
+                : models(request.taskFixedModels(), savedTaskFixedModels());
+        boolean fixedOn = request.taskFixedModelsOn() != null ? request.taskFixedModelsOn()
+                : "true".equals(store.all().get(TASK_FIXED_ON));
+        if (fixedOn && fixed.isEmpty()) {
+            throw new IllegalArgumentException("开启任务固定模型时，至少要选一个模型");
+        }
         store.put(AGENT_DEFAULT_MODEL, model);
         store.put(COMPANY_NAME, name(request.companyName(), 100));
         store.put(COMPANY_SHORT_NAME, name(request.companyShortName(), 20));

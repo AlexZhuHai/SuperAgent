@@ -128,6 +128,11 @@ sel.form.addEventListener("submit", async e => {
     });
     if (!res || !res.data) throw new Error((res && res.message) || "no data");
     systemSettings = res.data;
+    backupModels = (systemSettings.backupModels || []).slice();
+    renderBackupModels();
+    fixedModels = (systemSettings.taskFixedModels || []).slice();
+    fixedSelect.on.checked = !!systemSettings.taskFixedModelsOn;
+    renderFixedModels();
     sel.status.textContent = L("settings.saved");
       if (currentMe) {
       currentMe.companyName = systemSettings.companyName;

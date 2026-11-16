@@ -376,7 +376,8 @@ function markActiveThread() {
 }
 
 async function selectAgent(agent) {
-  if (streaming) return;
+  if (activeAgent && agent && activeAgent.id === agent.id && streaming) return; // already here, mid-reply
+  detachStream(); // a reply still coming in carries on on the server; coming back picks it up again
   stopLiveWatch(); // was watching a turn on the previous agent
   activeAgentId = agent.id;
   activeAgent = agent;
