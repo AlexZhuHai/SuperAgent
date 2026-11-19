@@ -119,6 +119,10 @@ public class TaskModelRouter implements TaskModelSelector {
 
     @Override
     public Optional<TaskModelChoice> strongest(Task task) {
+        List<String> fixed = settings.taskFixedModels();
+        if (!fixed.isEmpty()) {
+            return Optional.of(fixedStart(task, fixed, "复杂任务也不另选更强的模型，"));
+        }
         List<Candidate> forTasks = prices.candidates().stream().filter(Candidate::forTasks).toList();
         Candidate top = defaultFor(forTasks);
         if (top == null) {
@@ -128,6 +132,98 @@ public class TaskModelRouter implements TaskModelSelector {
                 null, describe(forTasks), "复杂任务：拆分子任务和最后汇总决定整体质量，不按难度省钱，直接用"
                 + (top.id().equals(defaultModel()) ? "默认模型 " : "最贵的 ") + top.id() + "；子任务各自按难度选最便宜够用的模型。",
                 Instant.now()));
+    }
+
+    @Override
+    public Optional<TaskModelChoice> reviewer(Task task, ReviewPurpose purpose, java.util.Set<String> runnableClis) {
+        List<String> fixed = settings.taskFixedModels();
+        List<Candidate> pool = (fixed.isEmpty() ? prices.candidates().stream().filter(Candidate::forTasks).toList() : usable(fixed))
+                .stream().filter(c -> runnableClis == null || runnableClis.contains(c.cli())).toList();
+        String within = fixed.isEmpty() ? "用于任务的模型" : "固定模型";
+        String own = task.model();
+        String doer = purpose == ReviewPurpose.REVIEW ? "开发" : "执行";
+        List<Candidate> others = pool.stream().filter(c -> !c.id().equals(own)).toList();
+        if (others.isEmpty()) {
+            Candidate self = pool.stream().filter(c -> c.id().equals(own)).findFirst().orElse(null);
+            if (self == null && own == null) {
+                return Optional.empty();
+            }
+            String cli = self != null ? self.cli() : task.agentType() == null ? null : task.agentType().cliName();
+            return Optional.of(new TaskModelChoice(task.id(), 0, TaskModelChoice.BY_REVIEWER, null, null, own, cli, null,
+                    describe(pool), (purpose == ReviewPurpose.REVIEW ? "审查和验收" : "独立检查") + "：" + within
+                    + "里只有这一个模型 " + own + "，只能用它，开新会话" + (purpose == ReviewPurpose.REVIEW ? "审查" : "检查")
+                    + "（不带" + doer + "过程）。", Instant.now()));
+        }
+        Candidate pick;
+        String why;
+        if (purpose == ReviewPurpose.CHECK) {
+            pick = others.get(0); // cheapest first
+            why = "独立检查：核对产出比做事容易，在" + within + "里排除执行模型 " + own + " 后选最便宜的 " + pick.id() + "。";
+        } else {
+            String vendor = ModelVendors.of(own, task.agentType() == null ? null : task.agentType().cliName());
+            List<Candidate> elsewhere = others.stream().filter(c -> !ModelVendors.of(c.id(), c.cli()).equals(vendor)).toList();
+            pick = strongest(elsewhere.isEmpty() ? others : elsewhere);
+            why = "审查和验收：要换一个模型看代码，在" + within + "里排除开发模型 " + own + "，"
+                    + (elsewhere.isEmpty() ? "没有其他厂商的模型，在同厂商（" + vendor + "）的其余模型里"
+                    : "优先其他厂商（开发模型是 " + vendor + " 的），在 " + ModelVendors.of(pick.id(), pick.cli()) + " 等其他厂商的模型里")
+                    + "选能力最强（按价格最贵）的 " + pick.id() + "。";
+        }
+        return Optional.of(new TaskModelChoice(task.id(), 0, TaskModelChoice.BY_REVIEWER, null, null, pick.id(), pick.cli(),
+                null, describe(pool), why, Instant.now()));
+    }
+
+    /** The dearest priced one (price as the stand-in for ability); unpriced ones only when none is priced. */
+    private static Candidate strongest(List<Candidate> pool) {
+        return pool.stream().filter(Candidate::priced).max(Comparator.comparingDouble(Candidate::blended))
+                .orElse(pool.get(pool.size() - 1));
+    }
+
+    // --- fixed models ---
+
+    /** The fixed models that can run now and that tasks may use, cheapest first (unpriced last). */
+    private List<Candidate> usable(List<String> fixed) {
+        return prices.candidates().stream().filter(c -> c.forTasks() && fixed.contains(c.id())).toList();
+    }
+
+    private TaskModelChoice fixedStart(Task task, List<String> fixed, String how) {
+        List<Candidate> usable = usable(fixed);
+        if (usable.isEmpty()) {
+            return refuse(task, fixed, "固定模型（" + String.join("、", fixed) + "）现在都用不了：没通过可用性检查，"
+                    + "或在「模型价格」里关掉了「用于任务」。任务不改用其他模型，直接失败。");
+        }
+        Candidate first = usable.get(0);
+        return new TaskModelChoice(task.id(), 0, TaskModelChoice.BY_FIXED, null, null, first.id(), first.cli(), null,
+                describe(usable), "系统设置开启了任务固定模型：" + how + "从固定模型里最便宜的 " + first.id()
+                + " 开始，失败再按价格换下一个。" + skipped(fixed, usable), Instant.now());
+    }
+
+    private TaskModelChoice fixedNext(Task task, List<String> fixed, String failure) {
+        List<Candidate> usable = usable(fixed);
+        int at = -1;
+        for (int i = 0; i < usable.size(); i++) {
+            if (usable.get(i).id().equals(task.model())) {
+                at = i;
+            }
+        }
+        String failed = "在 " + task.model() + " 上失败：" + clip(failure, 300) + "。";
+        if (at + 1 >= usable.size()) {
+            return refuse(task, fixed, failed + "固定模型里没有更贵的可以换了（" + String.join("、", fixed)
+                    + "），任务失败，不改用其他模型。");
+        }
+        Candidate next = usable.get(at + 1);
+        return new TaskModelChoice(task.id(), 0, TaskModelChoice.BY_FIXED, null, null, next.id(), next.cli(), null,
+                describe(usable), failed + "换固定模型里下一个更贵的 " + next.id()
+                + (at + 2 == usable.size() ? "（最后一个，再失败任务就失败）" : "") + " 重新执行。", Instant.now());
+    }
+
+    private TaskModelChoice refuse(Task task, List<String> fixed, String why) {
+        return new TaskModelChoice(task.id(), 0, TaskModelChoice.BY_FIXED, null, null, null, null, null,
+                String.join("\n", fixed), why, Instant.now());
+    }
+
+    private static String skipped(List<String> fixed, List<Candidate> usable) {
+        List<String> out = fixed.stream().filter(id -> usable.stream().noneMatch(c -> c.id().equals(id))).toList();
+        return out.isEmpty() ? "" : "（" + String.join("、", out) + " 现在用不了，跳过。）";
     }
 
     // --- judging ---
